@@ -242,7 +242,9 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
     // Solve T * vq / (vt + T) = maxQuote (all in SOL units) for T, in token units.
     const maxQuoteLamports = maxQuoteSol * LAMPORTS_PER_SOL;
     const tMax = (maxQuoteLamports * vt) / (vq - maxQuoteLamports);
-    if (tMax <= 0) return 0n;
+    // A degenerate reserve transplant (vq == maxQuote, or 0/0) makes tMax
+    // Infinity or NaN, and BigInt(NaN) throws and kills the bot — skip instead.
+    if (!Number.isFinite(tMax) || tMax <= 0) return 0n;
     const chunk = BigInt(Math.floor(tMax));
     return chunk >= tokens ? tokens : chunk;
   };
@@ -455,7 +457,9 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
         const reserveCapSol = (Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS_PER_SOL) * 0.8;
         let amount = Math.min(reserveCapSol, ticket, cfg.maxTotalExposureSol - exposureSol);
         if (amount > freeSol - txSol) amount = freeSol - txSol;
-        if (amount < cfg.minTicketSol) continue;
+        // Degenerate reserves can make the amount NaN/Infinity; BigInt(NaN)
+        // throws and kills the bot — skip the order instead.
+        if (!Number.isFinite(amount) || amount < cfg.minTicketSol) continue;
         const lamports = BigInt(Math.floor(amount * LAMPORTS_PER_SOL));
         orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: cfg.buySlippageBps });
         freeSol -= amount + txSol;
