@@ -10,11 +10,12 @@ data (agent-fun/replay/v2, Node 22, `main.ts`).
   CreateEvent) and its recent tape shows accelerating buy pressure: net SOL inflow
   over a lookback window, several distinct buying wallets, price climbing and sitting
   near its window high, with newer-half inflow exceeding older-half inflow.
-- **Sizing:** first ticket is tiny; the bot scales into strength only (price stepped
-  up from the last buy, position in profit, inflow still positive), up to a per-coin
-  ceiling.
-- **Exits:** stop loss vs cost, trailing stop once the position has run up, fade in
-  buy flow, a single very large sell, or a maximum hold time.
+- **Sizing:** one small ticket (0.25 SOL) per coin. The bot can pyramid into
+  strength, but tuning on the dev window showed scale-ins losing money there, so the
+  shipped config takes a single ticket per coin.
+- **Exits:** stop loss (-12% vs cost), take-profit (+12%), a tight trailing stop
+  (6% pullback once up 3%), a single very large sell, or a maximum hold time
+  (3,000 slots). A fade exit exists but is switched off by tuning.
 - **Guardrails:** pace-based probe round trips keep the run above 200 fills across
   20+ coins.
 

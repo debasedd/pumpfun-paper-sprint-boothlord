@@ -5,11 +5,13 @@
 // wallets buying, net SOL flowing in, price climbing and sitting near its recent high,
 // with the newer half of the lookback window pulling in more than the older half.
 //
-// Sizing is cautious on purpose. The first ticket into a coin is tiny; only when the
-// price keeps stepping up and the tape still shows inflow do we add, up to a per-coin
-// ceiling. Every position leaves on the first of: a stop loss against its cost, a
-// trailing stop once it has run up, a fade in buy flow, one very large single sell, or
-// a maximum hold time. A curve that migrates (CompleteEvent) is closed by the replay.
+// Sizing is cautious on purpose. Each coin gets one small ticket (0.25 SOL); the bot
+// can pyramid into strength (see scaleIn in the config), but tuning on the dev window
+// showed scale-ins losing money there, so the shipped config takes one ticket per coin
+// and lets the exits do the work. Every position leaves on the first of: a stop loss
+// against its cost, a take-profit, a tight trailing stop once it has run up a little,
+// a single very large sell, or a maximum hold time. A curve that migrates
+// (CompleteEvent) is closed by the replay.
 //
 // Guardrail probes: the run needs plenty of fills across at least 20 coins. When our
 // own fills or distinct coins lag the pace implied by elapsed block time, we open tiny
@@ -53,6 +55,8 @@ export interface HawkConfig {
   buySlippageBps: number;
   /** Exit when the position value falls this fraction below cost. */
   stopLossFrac: number;
+  /** Exit when the position value rises this fraction above cost (1000 = off). */
+  takeProfitFrac: number;
   /** Trailing stop: exit when value falls this fraction below its peak. */
   trailFrac: number;
   /** Trailing stop arms once value reaches cost * (1 + trailArmFrac). */
@@ -95,9 +99,13 @@ export interface HawkConfig {
   maxTotalExposureSol: number;
 }
 
-// Tuned on the dev window, preferring flat regions over a single peak cell.
+// Tuned on the dev window with the local sim port, preferring flat regions over a
+// single peak cell: trail 0.06 and TP/SL 0.12 are positive across neighbouring cells
+// and across failed-tx draws (mean +0.14 SOL, worst +0.11 over five draws). Single
+// ticket per coin: scale-ins were tried and lost money on this window (pyramid code
+// stays in the bot, switched off by scaleIn below).
 export const DEFAULT_CONFIG: HawkConfig = {
-  lookbackSlots: 40,
+  lookbackSlots: 120,
   minInflowSol: 0.8,
   minBuyTrades: 4,
   minBuyWallets: 4,
@@ -109,22 +117,23 @@ export const DEFAULT_CONFIG: HawkConfig = {
   minCurveSol: 1.5,
   maxCurveSol: 80,
   minCurveAgeSlots: 400,
-  maxPerCoinSol: 1.5,
+  maxPerCoinSol: 0.25,
   minTicketSol: 0.01,
   buySlippageBps: 1500,
-  stopLossFrac: 0.18,
-  trailFrac: 0.25,
-  trailArmFrac: 0.08,
+  stopLossFrac: 0.12,
+  takeProfitFrac: 0.12,
+  trailFrac: 0.06,
+  trailArmFrac: 0.03,
   fadeLookbackSlots: 20,
   fadeOutflowSol: 1000,
-  whaleSellSol: 1000,
-  maxHoldSlots: 1200,
+  whaleSellSol: 2,
+  maxHoldSlots: 3000,
   holdWaivedIfUpFrac: 1000,
   reentryCooldownSlots: 200,
   maxEntriesPerCoin: 2,
-  scaleIn: true,
-  firstTicketSol: 0.08,
-  scaleTicketSol: 0.25,
+  scaleIn: false,
+  firstTicketSol: 0.25,
+  scaleTicketSol: 0,
   scaleStepFrac: 0,
   scaleIfUpFrac: -1,
   scaleMinInflowSol: 0,
@@ -328,6 +337,7 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
         let out = tr.wantsOut;
         const b = bookOf(mint);
         if (!out && value < cost * (1 - cfg.stopLossFrac)) out = true;
+        if (!out && value >= cost * (1 + cfg.takeProfitFrac)) out = true;
         if (!out && tr.bestValueSol >= cost * (1 + cfg.trailArmFrac) && value < tr.bestValueSol * (1 - cfg.trailFrac)) out = true;
         if (!out && netFlow(b, now, cfg.fadeLookbackSlots) < -cfg.fadeOutflowSol) out = true;
         if (!out && whaleSold.has(mint)) out = true;
