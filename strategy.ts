@@ -1,17 +1,28 @@
 // Hawk momentum bot for the pump.fun bonding-curve replay (agent-fun/replay/v2).
 //
-// Idea: fresh pump.fun curves mostly dump after launch, so only buy a curve once it has
-// lived a while and its tape shows real, accelerating buy pressure: several different
-// wallets buying, net SOL flowing in, price climbing and sitting near its recent high,
-// with the newer half of the lookback window pulling in more than the older half.
+// Idea: fresh pump.fun curves mostly dump after launch, so only buy a curve once it
+// has proven itself as an established grinder: real SOL reserves in the 20-70 band
+// (already pumped 1.5-10x off its create price), at least 100 slots old, and a
+// 300-slot tape showing strong, broad, still-accelerating buy pressure — 20+ SOL of
+// net inflow, 30+ distinct buying wallets, price climbing and sitting near its
+// recent high, with the newer half of the lookback window pulling in more than the
+// older half. Most coins fail this bar; the few that pass are the ones that can
+// still run to migration.
 //
-// Sizing is cautious on purpose. Each coin gets one small ticket (0.25 SOL); the bot
+// Sizing is cautious on purpose. Each coin gets one small ticket (0.15 SOL); the bot
 // can pyramid into strength (see scaleIn in the config), but tuning on the dev window
 // showed scale-ins losing money there, so the shipped config takes one ticket per coin
 // and lets the exits do the work. Every position leaves on the first of: a stop loss
-// against its cost, a take-profit, a tight trailing stop once it has run up a little,
-// a single very large sell, or a maximum hold time. A curve that migrates
-// (CompleteEvent) is closed by the replay.
+// (-20% vs cost), a take-profit (+120% — bank the double, most runners dump after
+// it), a wide trailing stop (30% pullback once up 20%), a single very large sell,
+// or a maximum hold time. A curve that migrates (CompleteEvent) is closed by the
+// replay.
+//
+// Exits are chunked: the harness rejects a sell whose SOL proceeds exceed the
+// curve's live real SOL reserves, and a dumping coin's reserves collapse below a
+// whole position's value, so a whole-position sell gets stuck and the position rides
+// to zero. Each exit sells only the chunk whose proceeds stay under half the live
+// real reserves; the rest follows on later batches.
 //
 // Guardrail probes: the run needs plenty of fills across at least 20 coins. When our
 // own fills or distinct coins lag the pace implied by elapsed block time, we open tiny
@@ -45,8 +56,13 @@ export interface HawkConfig {
   /** Real SOL reserve bounds for an entry. */
   minCurveSol: number;
   maxCurveSol: number;
+  /** Price now over the CreateEvent price must lie in this band (0 / 1e12 = off). */
+  minRunup: number;
+  maxRunup: number;
   /** Slots since CreateEvent before an entry is allowed. */
   minCurveAgeSlots: number;
+  /** Slots since CreateEvent after which an entry is no longer allowed (1e12 = off). */
+  maxCurveAgeSlots: number;
   /** Total SOL committed to one coin at most. */
   maxPerCoinSol: number;
   /** Smallest buy worth sending. */
@@ -105,34 +121,37 @@ export interface HawkConfig {
 // ticket per coin: scale-ins were tried and lost money on this window (pyramid code
 // stays in the bot, switched off by scaleIn below).
 export const DEFAULT_CONFIG: HawkConfig = {
-  lookbackSlots: 120,
-  minInflowSol: 0.8,
-  minBuyTrades: 4,
-  minBuyWallets: 4,
-  minClimb: 0.04,
-  maxClimb: 2.0,
-  accelRatio: 1.2,
-  nearHighFrac: 0.93,
-  maxTopWalletShare: 0.6,
-  minCurveSol: 1.5,
-  maxCurveSol: 80,
-  minCurveAgeSlots: 400,
-  maxPerCoinSol: 0.25,
+  lookbackSlots: 300,
+  minInflowSol: 20,
+  minBuyTrades: 10,
+  minBuyWallets: 30,
+  minClimb: 0.05,
+  maxClimb: 1.0,
+  accelRatio: 0.5,
+  nearHighFrac: 0.85,
+  maxTopWalletShare: 0.4,
+  minCurveSol: 20,
+  maxCurveSol: 70,
+  minCurveAgeSlots: 100,
+  maxCurveAgeSlots: 1e12,
+  minRunup: 1.5,
+  maxRunup: 10,
+  maxPerCoinSol: 0.15,
   minTicketSol: 0.01,
   buySlippageBps: 1500,
-  stopLossFrac: 0.12,
-  takeProfitFrac: 0.12,
-  trailFrac: 0.06,
-  trailArmFrac: 0.03,
+  stopLossFrac: 0.2,
+  takeProfitFrac: 1.2,
+  trailFrac: 0.3,
+  trailArmFrac: 0.2,
   fadeLookbackSlots: 20,
   fadeOutflowSol: 1000,
-  whaleSellSol: 2,
-  maxHoldSlots: 3000,
+  whaleSellSol: 5,
+  maxHoldSlots: 10000,
   holdWaivedIfUpFrac: 1000,
   reentryCooldownSlots: 200,
-  maxEntriesPerCoin: 2,
+  maxEntriesPerCoin: 1,
   scaleIn: false,
-  firstTicketSol: 0.25,
+  firstTicketSol: 0.15,
   scaleTicketSol: 0,
   scaleStepFrac: 0,
   scaleIfUpFrac: -1,
@@ -161,6 +180,7 @@ interface Tick {
 
 interface CoinBook {
   bornSlot: number | null;
+  createPrice: number;
   ticks: Tick[];
   entriesUsed: number;
   lastExitSlot: number;
@@ -190,7 +210,7 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
   const bookOf = (mint: Pubkey): CoinBook => {
     let b = books.get(mint);
     if (b === undefined) {
-      b = { bornSlot: null, ticks: [], entriesUsed: 0, lastExitSlot: -1e12 };
+      b = { bornSlot: null, createPrice: 0, ticks: [], entriesUsed: 0, lastExitSlot: -1e12 };
       books.set(mint, b);
     }
     return b;
@@ -207,10 +227,34 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
     return net;
   };
 
+  /**
+   * Tokens to sell now when exiting a position: the harness rejects a sell whose
+   * SOL proceeds exceed the curve's live real SOL reserves, and a dumping coin's
+   * reserves collapse below a whole position's value — so a whole-position sell gets
+   * stuck, retried every batch, while the position rides to zero. Sell only the
+   * chunk whose proceeds stay under half the live real reserves; the rest follows
+   * on later batches once the first chunk lands.
+   */
+  const exitChunk = (tokens: bigint, vq: number, vt: number, rqSol: number): bigint => {
+    if (tokens <= 0n || rqSol <= 0 || vq <= 0 || vt <= 0) return 0n;
+    const maxQuoteSol = rqSol * 0.5;
+    if (maxQuoteSol <= 0) return 0n;
+    // Solve T * vq / (vt + T) = maxQuote (all in SOL units) for T, in token units.
+    const maxQuoteLamports = maxQuoteSol * LAMPORTS_PER_SOL;
+    const tMax = (maxQuoteLamports * vt) / (vq - maxQuoteLamports);
+    if (tMax <= 0) return 0n;
+    const chunk = BigInt(Math.floor(tMax));
+    return chunk >= tokens ? tokens : chunk;
+  };
+
   /** Entry signal: true when the tape shows accelerating, broad-based buy pressure. */
-  const entryOk = (b: CoinBook, now: number, realSol: number): boolean => {
+  const entryOk = (b: CoinBook, now: number, realSol: number, priceNow: number): boolean => {
     if (realSol < cfg.minCurveSol || realSol > cfg.maxCurveSol) return false;
-    if (b.bornSlot === null || now - b.bornSlot < cfg.minCurveAgeSlots) return false;
+    if (b.bornSlot === null || now - b.bornSlot < cfg.minCurveAgeSlots || now - b.bornSlot > cfg.maxCurveAgeSlots) return false;
+    if (b.createPrice > 0) {
+      const runup = priceNow / b.createPrice;
+      if (runup < cfg.minRunup || runup > cfg.maxRunup) return false;
+    }
     const start = now - cfg.lookbackSlots;
     const mid = now - cfg.lookbackSlots / 2;
     let buySol = 0;
@@ -272,7 +316,9 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
           if (lastBlockTime === null || e.block_time > lastBlockTime) lastBlockTime = e.block_time;
         }
         if (e.event === 'CreateEvent') {
-          bookOf(e.mint).bornSlot = e.slot;
+          const b = bookOf(e.mint);
+          b.bornSlot = e.slot;
+          b.createPrice = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
         } else if (e.event === 'TradeEvent') {
           const b = bookOf(e.mint);
           const sol = Number(e.sol_amount) / LAMPORTS_PER_SOL;
@@ -346,7 +392,9 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
         tr.wantsOut = true;
         if (pendingSell(mint)) continue;
         if (orders.length >= maxOrders) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+        const chunk = exitChunk(BigInt(pos.token_amount), vq, vt, realSol);
+        if (chunk <= 0n) continue;
+        orders.push({ side: 'sell', mint, token_amount: chunk.toString(), max_slippage_bps: 10_000 });
       }
 
       // ---- Probe round trips: sell the probe as soon as its buy has landed. ----
@@ -359,7 +407,13 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
         }
         if (curve === undefined || curve.complete || pendingByMint.has(mint)) continue;
         if (orders.length >= maxOrders) break;
-        orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+        const pmk = marks.get(mint);
+        const pvq = pmk ? Number(pmk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
+        const pvt = pmk ? Number(pmk.virtual_token_reserves) : Number(curve.virtual_token_reserves);
+        const prq = (pmk ? Number(pmk.real_quote_reserves) : Number(curve.real_quote_reserves)) / LAMPORTS_PER_SOL;
+        const pchunk = exitChunk(BigInt(pos.token_amount), pvq, pvt, prq);
+        if (pchunk <= 0n) continue;
+        orders.push({ side: 'sell', mint, token_amount: pchunk.toString(), max_slippage_bps: 10_000 });
         if (!selling) probes.set(mint, true);
       }
 
@@ -384,7 +438,7 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
         if (tr === undefined) {
           if (slotsLeft <= 0 || mainLeft <= 0) continue;
           if (b.entriesUsed >= cfg.maxEntriesPerCoin || now - b.lastExitSlot < cfg.reentryCooldownSlots) continue;
-          if (!entryOk(b, now, realSol)) continue;
+          if (!entryOk(b, now, realSol, price)) continue;
           ticket = Math.min(cfg.firstTicketSol, cfg.maxPerCoinSol);
         } else {
           // Scale in only into strength: price stepped up from the last buy, the
@@ -398,7 +452,7 @@ export function createHawkBot(cfg: HawkConfig = DEFAULT_CONFIG): Bot {
           if (realSol > cfg.maxCurveSol) continue;
           ticket = Math.min(cfg.scaleTicketSol, cfg.maxPerCoinSol - tr.spentSol);
         }
-        const reserveCapSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS_PER_SOL;
+        const reserveCapSol = (Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS_PER_SOL) * 0.8;
         let amount = Math.min(reserveCapSol, ticket, cfg.maxTotalExposureSol - exposureSol);
         if (amount > freeSol - txSol) amount = freeSol - txSol;
         if (amount < cfg.minTicketSol) continue;
